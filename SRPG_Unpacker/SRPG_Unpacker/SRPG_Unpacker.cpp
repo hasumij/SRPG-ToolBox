@@ -41,7 +41,7 @@
 
 namespace fs = std::filesystem;
 
-static const std::string APP_NAME = "SRPG_Unpacker v0.1.0";
+static const std::string APP_NAME = "SRPG_Unpacker v0.1.1";
 
 // TODO:
 // - Redesign section name handling, current solution is not great

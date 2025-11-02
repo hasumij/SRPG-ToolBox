@@ -31,6 +31,7 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <algorithm>
 
 #include "Crypt.h"
 #include "DTSTool.h"
@@ -43,8 +44,11 @@ namespace fs = std::filesystem;
 
 static const std::string APP_NAME = "SRPG_Unpacker v0.1.1";
 
+static const std::string RES_MAPPINGS_FILE = "res_mapping.json";
+
 // TODO:
 // - Redesign section name handling, current solution is not great
+// - This file needs a general cleanup and some restructuring
 
 // v1.140 (0x474) Added support for video archiving, before that it was not present in the archive
 
@@ -85,8 +89,11 @@ std::wstring RestoreFileName(const std::string& filename, const std::string& sec
 	return fN;
 }
 
-void ProcessFile(const std::wstring& dtsFolder, const fs::path& path, const fs::path& outFolder, const nlohmann::ordered_json& j)
+bool g_openAreSrk = false;
+
+std::string ProcessFile(const std::wstring& dtsFolder, const fs::path& path, const fs::path& outFolder, const nlohmann::ordered_json& j)
 {
+	// TODO: Rewrite using fs::path::lexically_relative
 	const std::wstring parentFolder = path.parent_path().wstring();
 	std::wstring localPath          = parentFolder.substr(dtsFolder.size() + 1);
 
@@ -100,6 +107,8 @@ void ProcessFile(const std::wstring& dtsFolder, const fs::path& path, const fs::
 
 	if (ext == L".srk")
 	{
+		g_openAreSrk = true;
+
 		std::wstring inSecPath = localPath.substr(secName.size());
 
 		std::vector<std::wstring> folders = SplitString(inSecPath, L'\\');
@@ -111,8 +120,13 @@ void ProcessFile(const std::wstring& dtsFolder, const fs::path& path, const fs::
 			f = RestoreFileName(ws2s(f), secName, j);
 		}
 
+		// Remove empty folders from the list
+		folders.erase(std::remove_if(folders.begin(), folders.end(),
+									 [](const std::wstring& s) { return s.empty(); }),
+					  folders.end());
+
 		// Rebuild the path
-		localPath = std::format(L"{}/{}", s2ws(secName), JoinString(folders, L'\\'));
+		localPath = std::format(L"{}\\{}", s2ws(secName), JoinString(folders, L'\\'));
 
 		fN = RestoreFileName(ws2s(fN), secName, j);
 		Crypt::DecryptData(data);
@@ -120,33 +134,73 @@ void ProcessFile(const std::wstring& dtsFolder, const fs::path& path, const fs::
 
 	ext = GetFileExtension(data);
 
-	fs::path outPath = outFolder / localPath / std::format(L"{}{}", fN, ext);
+	fs::path outLocalFilePath = fs::path(localPath) / std::format(L"{}{}", fN, ext);
+	fs::path outPath = outFolder / outLocalFilePath;
 
 	// Make sure the folder exists
 	fs::create_directories(outPath.parent_path());
 
 	FileWriter::WriteFile(outPath.wstring(), data);
+
+	return ws2s(outLocalFilePath.wstring());
 }
 
-void CopyAndDecryptOpenData(const std::wstring& dtsFolder, const fs::path& outFolder, const nlohmann::ordered_json& j)
+nlohmann::ordered_json CopyAndDecryptOpenData(const fs::path& dtsFolder, const fs::path& outFolder, const nlohmann::ordered_json& j)
 {
 	const static std::vector<std::wstring> FOLDER_NAMES = { L"Graphics", L"UI", L"Audio", L"Fonts", L"Video" };
 
+	nlohmann::ordered_json resMapping;
+
 	for (const auto& folder : FOLDER_NAMES)
 	{
-		std::wstring folderPath = std::format(L"{}/{}", dtsFolder, folder);
+		fs::path folderPath = dtsFolder / folder;
 
 		if (fs::exists(folderPath))
 		{
-			std::cout << " - Processing folder: " << ws2s(folderPath) << " ... " << std::flush;
+			std::cout << " - Processing folder: " << ws2s(folderPath.wstring()) << " ... " << std::flush;
 			for (const auto& entry : fs::recursive_directory_iterator(folderPath))
 			{
 				if (entry.is_regular_file())
-					ProcessFile(dtsFolder, entry.path(), outFolder, j);
+				{
+					std::string newLocalPath = ProcessFile(dtsFolder.wstring(), entry.path(), outFolder, j);
+					std::string oldLocalPath = ws2s(entry.path().lexically_relative(dtsFolder).wstring());
+					resMapping[newLocalPath] = oldLocalPath;
+				}
 			}
 			std::cout << "Done" << std::endl;
 		}
 	}
+
+	return resMapping;
+}
+
+void CopyAndEncryptOpenData(const fs::path& inFolder, const fs::path& outFolder, const nlohmann::ordered_json& j)
+{
+	const std::size_t numFiles = j.size();
+	const std::size_t padWidth = std::to_string(numFiles).size();
+	std::size_t currentFile    = 0;
+
+	for (const auto& [decName, encName] : j.items())
+	{
+		std::cout << std::format("Processing file {:0{}}/{}\r", ++currentFile, padWidth, numFiles) << std::flush;
+		fs::path inFilePath  = inFolder / s2ws(decName);
+		fs::path outFilePath = outFolder / s2ws(encName.get<std::string>());
+
+		if (!fs::exists(inFilePath))
+		{
+			std::cerr << std::format("Warning: File to encrypt not found: {}", inFilePath.string()) << std::endl;
+			continue;
+		}
+
+		std::vector<uint8_t> data;
+		FileReader::ReadFile(inFilePath.wstring(), data);
+		Crypt::EncryptData(data);
+
+		// Make sure the folder exists
+		fs::create_directories(outFilePath.parent_path());
+		FileWriter::WriteFile(outFilePath.wstring(), data);
+	}
+	std::cout << std::endl;
 }
 
 // From: https://stackoverflow.com/a/45588456
@@ -223,11 +277,19 @@ void unpack(const fs::path& dtsFile, const fs::path& outFolder = L"output")
 	}
 
 	std::cout << "Copying and decrypting data not in the archive ... " << std::endl;
-	CopyAndDecryptOpenData(dtsFile.parent_path().wstring(), outFolder, sp.GetResMapping());
+	nlohmann::ordered_json resMapping = CopyAndDecryptOpenData(dtsFile.parent_path().wstring(), outFolder, sp.GetResMapping());
+
+	if (g_openAreSrk)
+	{
+		// Save the res mapping json for reference
+		std::ofstream ofs(outFolder / RES_MAPPINGS_FILE);
+		ofs << resMapping.dump(4);
+		ofs.close();
+	}
 	std::cout << "Finished copying and decrypting data" << std::endl;
 }
 
-void pack(const fs::path& inFolder, const fs::path& outFile = L"output.dts")
+void pack(const fs::path& inFolder, const fs::path& outFile = L"output.dts", const bool& repackSrk = false)
 {
 	// Make sure the output file is not currently in use
 	if (fs::exists(outFile))
@@ -240,6 +302,41 @@ void pack(const fs::path& inFolder, const fs::path& outFile = L"output.dts")
 
 	DTSTool dtsT;
 	dtsT.Pack(inFolder, outFile);
+
+	if (repackSrk)
+	{
+		// Make sure the res_mapping file exists
+		const fs::path resMappingFile = inFolder / RES_MAPPINGS_FILE;
+		if (!fs::exists(resMappingFile))
+		{
+			std::cerr << std::format("Warning: {} not found, cannot repack .srk files", RES_MAPPINGS_FILE) << std::endl;
+			return;
+		}
+
+		std::ifstream resFile(resMappingFile);
+		if (!resFile)
+		{
+			std::cerr << std::format("Warning: Failed to open: {}", resMappingFile.string()) << std::endl;
+			return;
+		}
+
+		ConfigManager::Load(inFolder / FileHeader::CONFIG_NAME);
+
+		DWORD version = ConfigManager::Get<DWORD>("fileVersion");
+		std::array<uint8_t, 16> key = ConfigManager::Get<std::array<uint8_t, 16>>("customKey");
+
+		if (version >= NEW_CRYPT_START_VERSION)
+		{
+			// Switch the encryption key
+			Crypt::SwitchToCustomKey(key);
+		}
+
+		const nlohmann::ordered_json j = nlohmann::ordered_json::parse(resFile);
+
+		std::cout << "Repacking .srk files ... " << std::endl;
+		CopyAndEncryptOpenData(inFolder, outFile.parent_path(), j);
+		std::cout << "Finished repacking .srk files" << std::endl;
+	}
 }
 
 enum class PatchMode
@@ -250,23 +347,13 @@ enum class PatchMode
 
 SRPG_ProjectData initSRPGData(const fs::path& dataFolder)
 {
-	nlohmann::ordered_json config;
 	std::vector<BYTE> data;
 	readDatFile(dataFolder, data);
 
-	readConfigFile(dataFolder, config);
-	DWORD version = 0;
-	DWORD resFlag = 0;
+	ConfigManager::Load(dataFolder / FileHeader::CONFIG_NAME);
 
-	if (config.contains("fileVersion"))
-		version = config["fileVersion"].get<DWORD>();
-	else
-		throw std::runtime_error("Config file does not contain 'fileVersion'");
-
-	if (config.contains("segments"))
-		resFlag = config["segments"].get<DWORD>();
-	else
-		throw std::runtime_error("Config file does not contain 'segments'");
+	DWORD version = ConfigManager::Get<DWORD>("fileVersion");
+	DWORD resFlag = ConfigManager::Get<DWORD>("segments");
 
 	return { version, resFlag, data };
 }
@@ -321,6 +408,9 @@ int main(int argc, char* argv[])
 	bool parseDat = false;
 	app.add_flag("--parse-dat", parseDat, "Parse the project.dat file (for debugging purposes only)");
 
+	bool repackSrk = false;
+	app.add_flag("--repack-srk", repackSrk, "Repack .srk files when packing");
+
 	CLI11_PARSE(app, argc, argv);
 
 	EnableUTF8Print();
@@ -344,7 +434,7 @@ int main(int argc, char* argv[])
 		else if (fs::is_directory(inputPath))
 		{
 			const fs::path outputPath = (output.empty() ? defaultPack : output);
-			pack(inputPath, outputPath);
+			pack(inputPath, outputPath, repackSrk);
 			std::cout << "Successfully packed to: " << ws2s(outputPath.wstring()) << std::endl;
 		}
 		else if (inputPath.extension() == L".dat" && fs::exists(inputPath))

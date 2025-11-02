@@ -180,7 +180,7 @@ private:
 		std::ifstream file(filename);
 		if (!file.is_open())
 		{
-			std::cerr << "Error: Unable to open config file." << std::endl;
+			std::cerr << "Error: Unable to open config file: " << filename.string() << std::endl;
 			return;
 		}
 
@@ -195,7 +195,7 @@ private:
 		std::ofstream file(filename);
 		if (!file.is_open())
 		{
-			std::cerr << "Error: Unable to open config file." << std::endl;
+			std::cerr << "Error: Unable to open config file for writing: " << filename.string() << std::endl;
 			return;
 		}
 
